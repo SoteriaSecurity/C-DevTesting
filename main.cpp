@@ -66,6 +66,8 @@ int main() {
             break;
         }
 
+       cv::flip(frame, frame, 1);
+
         // Display the resulting frame
         cv::imshow("Webcam", frame);
 
