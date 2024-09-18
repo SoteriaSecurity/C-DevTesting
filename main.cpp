@@ -1,12 +1,9 @@
-/*
-
 #include <filesystem>
 #include <fstream>
 #include <iostream>
 #include <opencv2/opencv.hpp>
 #include <opencv2/videoio.hpp>
-#include <opencv2/dnn/dnn.hpp>
-#include <stdlib.h>
+#include </Users/omkarbantanur/Downloads/onnxruntime/include/onnxruntime_cxx_api.h>
 #include <boost/log/core.hpp>
 #include <boost/log/trivial.hpp>
 #include <boost/log/expressions.hpp>
@@ -23,7 +20,6 @@ namespace src = boost::log::sources;
 namespace keywords = boost::log::keywords;
 
 void init_logging() {
-    // Set log file format and rotate daily
     logging::add_file_log(
         keywords::file_name = "log/soteria_%Y-%m-%d.log",  // Log filename with date suffix
         keywords::rotation_size = 10 * 1024 * 1024,        // 10 MB rotation
@@ -32,162 +28,132 @@ void init_logging() {
         keywords::auto_flush = true
     );
 
-    // Add console output
     logging::add_console_log(
         std::cout,
         keywords::format = "[%TimeStamp%] [%Severity%] %Message%"
     );
 
-    // Add common attributes like timestamp
     logging::add_common_attributes();
 }
 
-void setupWebcam(cv::dnn::Net net, std::vector<std::string> classes) {
-    // Initialize logger
+void setupWebcam(Ort::Session& session, Ort::Env& env, std::vector<std::string> classes) {
     init_logging();
     BOOST_LOG_TRIVIAL(info) << "Application started";
 
-    // Create log directory if it doesn't exist
     if (!fs::exists("log")) {
+
         fs::create_directory("log");
         BOOST_LOG_TRIVIAL(info) << "Log directory created";
+
     }
 
-    // Open the default camera (index 0)
     cv::VideoCapture capture(0);
+
     if (!capture.isOpened()) {
+
         BOOST_LOG_TRIVIAL(error) << "Unable to open camera";
         exit(1);
     }
+
+    Ort::AllocatorWithDefaultOptions allocator;
+
+    // Get input and output names
+    auto inputNameAllocated = session.GetInputNameAllocated(0, allocator);
+    auto outputNameAllocated = session.GetOutputNameAllocated(0, allocator);
+    const char* inputName = inputNameAllocated.get();
+    const char* outputName = outputNameAllocated.get();
+
+    size_t inputTensorSize = 1 * 3 * 320 * 320;
+    std::vector<int64_t> inputShape = {1, 3, 320, 320};
 
     while (true) {
 
         cv::Mat frame;
 
-        // Capture frame-by-frame
-        bool frame_available = capture.read(frame);
-
-        if (!frame_available) {
+        if (!capture.read(frame)) {
             BOOST_LOG_TRIVIAL(error) << "Failed to read from camera";
             break;
         }
 
-        cv::Mat blob = cv::dnn::blobFromImage(frame, 1 / 255.0, cv::Size(640, 640), cv::Scalar(0, 0, 0), true, false);
-        net.setInput(blob);
+        cv::Mat blob = cv::dnn::blobFromImage(frame, 1 / 255.0, cv::Size(320, 320), cv::Scalar(0, 0, 0), true, false);
 
-        std::vector<cv::Mat> outputs;
-        net.forward(outputs, net.getUnconnectedOutLayersNames());
+        if (blob.empty()) {
+            BOOST_LOG_TRIVIAL(error) << "Failed to create blob from frame!";
+            continue;  // Skip processing if the blob is invalid
+        }
 
-        float confidenceThreshold = 0.75;  // Confidence threshold
+        if (inputTensorSize != blob.total()) {
+            BOOST_LOG_TRIVIAL(error) << "Mismatch in tensor size and blob data.";
+            exit(1);
+        }
 
-        for (const auto& output : outputs) {
+        float* blobData = reinterpret_cast<float*>(blob.data);
 
-            auto* data = (float*)output.data;
+        if (!blobData) {
+            BOOST_LOG_TRIVIAL(error) << "Blob data is null!";
+            exit(1);  // Exit if the blob data pointer is invalid
+        }
 
-            for (int i = 0; i < output.rows; ++i, data += output.cols) {
+            // Create input tensor
+            Ort::MemoryInfo memoryInfo = Ort::MemoryInfo::CreateCpu(OrtDeviceAllocator, OrtMemTypeCPU);
+            Ort::Value inputTensor = Ort::Value::CreateTensor<float>(memoryInfo, blobData, inputTensorSize, inputShape.data(), inputShape.size());
 
-                float confidence = data[4];  // Objectness score
+            // Run the inference session
+            std::vector<Ort::Value> outputTensors = session.Run(Ort::RunOptions{nullptr}, &inputName, &inputTensor, 1, &outputName, 1);
+
+            // Get the output data (outputTensors.front() gives the first output)
+            float* outputData = outputTensors.front().GetTensorMutableData<float>();
+
+            float confidenceThreshold = 0.75;
+
+            for (size_t i = 0; i < outputTensors.front().GetTensorTypeAndShapeInfo().GetElementCount(); i += 7) {
+
+                float confidence = outputData[i + 2];
 
                 if (confidence > confidenceThreshold) {
 
-                    float* classesScores = data + 5;
-                    cv::Point classIdPoint;
-                    double maxClassScore;
+                    int classId = static_cast<int>(outputData[i + 1]);
+                    std::string label = classes[classId];
 
-                    cv::minMaxLoc(cv::Mat(1, classes.size(), CV_32FC1, classesScores), 0, &maxClassScore, 0, &classIdPoint);
+                    if (label == "weapon" || label == "fire") {
 
-                    if (maxClassScore > confidenceThreshold) {
-                        int classId = classIdPoint.x;
-                        std::string label = classes[classId];
+                        int x = static_cast<int>(outputData[i + 3] * frame.cols);
+                        int y = static_cast<int>(outputData[i + 4] * frame.rows);
+                        int width = static_cast<int>(outputData[i + 5] * frame.cols);
+                        int height = static_cast<int>(outputData[i + 6] * frame.rows);
 
-                        // Only process "weapon" or "fire" classes
-                        if (label == "weapon" || label == "fire") {
-                            // Extract bounding box coordinates
-                            int x = static_cast<int>(data[0] * frame.cols);
-                            int y = static_cast<int>(data[1] * frame.rows);
-                            int width = static_cast<int>(data[2] * frame.cols);
-                            int height = static_cast<int>(data[3] * frame.rows);
-
-                            // Draw bounding box and label
-                            cv::Rect box(x - width / 2, y - height / 2, width, height);
-                            cv::rectangle(frame, box, cv::Scalar(0, 255, 0), 2);
-                            cv::putText(frame, label, cv::Point(x - width / 2, y - height / 2 - 10),
-                                        cv::FONT_HERSHEY_SIMPLEX, 0.5, cv::Scalar(0, 255, 0), 2);
-                        }
+                        cv::Rect box(x - width / 2, y - height / 2, width, height);
+                        cv::rectangle(frame, box, cv::Scalar(0, 255, 0), 2);
+                        cv::putText(frame, label, cv::Point(x - width / 2, y - height / 2 - 10),
+                                    cv::FONT_HERSHEY_SIMPLEX, 0.5, cv::Scalar(0, 255, 0), 2);
                     }
                 }
             }
+
+            char key = (char)cv::waitKey(1);
+            if (key == 27) {
+                BOOST_LOG_TRIVIAL(info) << "ESC key pressed. Exiting.";
+                break;
+            }
         }
-        // Capture keyboard input
-        char key = (char)cv::waitKey(1);
-        // If 'ESC' key is pressed, exit loop
-        if (key == 27) {
-            BOOST_LOG_TRIVIAL(info) << "ESC key pressed. Exiting.";
-            break;
-        }
+
+        capture.release();
+        cv::destroyAllWindows();
+        BOOST_LOG_TRIVIAL(info) << "Application ended";
     }
 
-    // Release the camera and close any OpenCV windows
-    capture.release();
-    cv::destroyAllWindows();
 
-    BOOST_LOG_TRIVIAL(info) << "Application ended";
+int main() {
+    Ort::Env env(ORT_LOGGING_LEVEL_WARNING, "ONNXModel");
+    Ort::SessionOptions sessionOptions;
+    sessionOptions.SetGraphOptimizationLevel(GraphOptimizationLevel::ORT_ENABLE_EXTENDED);
+
+    Ort::Session session(env, "/Users/omkarbantanur/Downloads/best.onnx", sessionOptions);
+
+    std::vector<std::string> classNames = {"money", "knife", "monedero", "pistol", "smartphone", "tarjeta"};
+
+    setupWebcam(session, env, classNames);
+    return 0;
 }
 
 // Helper function to get class names from a file
-/*
- std::vector<std::string> getClassNames(const std::string& filename) {
-    std::vector<std::string> classNames;
-    std::ifstream file(filename);
-    if (!file.is_open()) {
-        std::cerr << "Error opening class names file!" << std::endl;
-        return classNames;
-    }
-    std::string line;
-    while (std::getline(file, line)) {
-        classNames.push_back(line);
-    }
-    return classNames;
-}
-
-
-int main() {
-
-
-    std::string modelWeights = "best.onnx";
-    std::vector<std::string> classNames = {"money", "knife", "monedero", "pistol", "smartphone", "tarjeta"};
-
-    cv::dnn::Net net = cv::dnn::readNetFromONNX( modelWeights);
-    net.setPreferableBackend(cv::dnn::DNN_BACKEND_OPENCV);
-    net.setPreferableTarget(cv::dnn::DNN_TARGET_OPENCL);
-
-    setupWebcam(net, classNames);
-
-
-    return 0;
-}
-
-*/
-
-#include <opencv2/opencv.hpp>
-#include <iostream>
-
-int main() {
-    const std::string modelWeights = "/Users/omkarbantanur/Downloads/best.onnx";
-
-    // Try loading the ONNX model
-    cv::dnn::Net net;
-    try {
-        net = cv::dnn::readNetFromONNX(modelWeights);
-    } catch (const cv::Exception& e) {
-        std::cerr << "Error loading ONNX model: " << modelWeights << std::endl;
-        std::cerr << e.what() << std::endl;
-        return -1;
-    }
-
-    net.setPreferableBackend(cv::dnn::DNN_BACKEND_OPENCV);
-    net.setPreferableTarget(cv::dnn::DNN_TARGET_OPENCL);
-
-    std::cout << "Model loaded successfully!" << std::endl;
-    return 0;
-}
