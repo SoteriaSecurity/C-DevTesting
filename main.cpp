@@ -139,7 +139,7 @@ void setupWebcam(Ort::Session& session, Ort::Env& env, std::vector<std::string> 
             BOOST_LOG_TRIVIAL(info) << "Memory usage8: " << memUsage << " KB";
 
             if (confidence > confidenceThreshold) {
-                int classId = static_cast<int>(outputData[i + 1]);
+                int classId = static_cast<int>(outputData[i + 1]) %;
                 std::string label = classes[classId];
 
                 memUsage = getMemoryUsage();
